@@ -1,0 +1,237 @@
+## ATTENZIONE REQUISITI #########
+# questo package richiede che siano presenti le seg integrazioni:
+# - REST (https://www.home-assistant.io/integrations/rest/)
+# - utility_meter (https://www.home-assistant.io/integrations/utility_meter/)
+# - time_date (https://www.home-assistant.io/integrations/time_date/) sfrutto il fatto che
+#   "the date sensor updates each day at midnight"
+#################################
+
+# Input per la configurazione
+input_text:
+  hp_instantink_ip_address_stampante:
+    name: IP Address stampante
+    icon: mdi:ip-network-outline
+    pattern: ^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$
+input_number:
+  hp_instantink_pagine_nel_piano:
+    name: Pagine nel piano
+    min: 1
+    max: 1500
+    step: 1
+    unit_of_measurement: Pagine
+    mode: box
+    icon: mdi:tray-full
+  hp_instantink_max_pagine_accumulabili:
+    name: Max Pagine accumulabili
+    min: 0
+    max: 4500
+    step: 1
+    unit_of_measurement: Pagine
+    mode: box
+    icon: mdi:tray-arrow-up
+  hp_instantink_pagine_accumulate:
+    name: Pagine accumulate
+    min: 0
+    max: 4500
+    step: 1
+    unit_of_measurement: Pagine
+    mode: box
+    icon: mdi:tray-plus
+  hp_instantink_pagine_set_extra:
+    name: Pagine in un set extra
+    min: 10
+    max: 20
+    step: 1
+    unit_of_measurement: Pagine
+    mode: box
+    icon: mdi:tray-alert
+  hp_instantink_costo_set_extra:
+    name: Costo di un set extra
+    min: 1.00
+    max: 2.00
+    step: 0.01
+    unit_of_measurement: €
+    mode: box
+    icon: mdi:currency-eur
+  hp_instantink_costo_piano:
+    name: Costo del piano
+    min: 1.49
+    max: 54.99
+    step: 0.01
+    unit_of_measurement: €
+    mode: box
+    icon: mdi:currency-eur
+  hp_instantink_gg_inizio_ciclo:
+    name: Giorno del mese inizio ciclo di fatturazione
+    min: 1
+    max: 31
+    step: 1
+    mode: box
+    icon: mdi:calendar-today
+
+# RESTful
+rest:
+  - resource_template: https://{{states('input_text.hp_instantink_ip_address_stampante')}}/DevMgmt/ProductConfigDyn.xml
+    scan_interval: 3600
+    verify_ssl: false
+    method: GET
+    timeout: 30
+    sensor:
+      - name: Modello stampante
+        value_template: "{{ value_json['prdcfgdyn2:ProductConfigDyn']['prdcfgdyn:ProductInformation']['dd:MakeAndModel']}}"
+        json_attributes_path: '$.prdcfgdyn2:ProductConfigDyn.prdcfgdyn:ProductInformation'
+        json_attributes: 
+          - dd:Version
+          - dd:SerialNumber
+    binary_sensor:
+      - name: Connessione stampante
+        value_template: "{{ 'ProductConfigDyn' in value }}"
+        device_class: connectivity
+  
+  - resource_template: https://{{states('input_text.hp_instantink_ip_address_stampante')}}/DevMgmt/ProductStatusDyn.xml
+    scan_interval: 120
+    timeout: 20
+    verify_ssl: false
+    method: GET
+    sensor:
+      - name: Status stampante
+        value_template: >
+          {% set possibili_status = ['ready','scanProcessing','copying','processing','cancelJob','inPowerSave'] %}
+          {{ value_json['psdyn:ProductStatusDyn']['psdyn:Status']
+            |selectattr('pscat:StatusCategory', 'in', possibili_status) 
+            | map(attribute='pscat:StatusCategory') | list | first }}
+      
+
+  - resource_template: https://{{states('input_text.hp_instantink_ip_address_stampante')}}/DevMgmt/ProductUsageDyn.xml
+    scan_interval: 120
+    timeout: 20
+    verify_ssl: false
+    method: GET
+    sensor:
+      - name: Pagine stampate totali
+        value_template: "{{ value_json['pudyn:ProductUsageDyn']['pudyn:PrinterSubunit']['dd:TotalImpressions']['#text'] | int }}"
+        unit_of_measurement: Pagine
+      - name: Livello inchiostro Black
+        value_template: >
+          {{ value_json['pudyn:ProductUsageDyn']['pudyn:ConsumableSubunit']['pudyn:Consumable'] 
+            | selectattr('dd:MarkerColor', 'eq', 'Black') 
+            | map(attribute='dd:ConsumableRawPercentageLevelRemaining') 
+            | list  | first | int }}
+        unit_of_measurement: '%'
+      - name: Livello inchiostro CyanMagentaYellow
+        value_template: >
+          {{ value_json['pudyn:ProductUsageDyn']['pudyn:ConsumableSubunit']['pudyn:Consumable'] 
+            | selectattr('dd:MarkerColor', 'eq', 'CyanMagentaYellow') 
+            | map(attribute='dd:ConsumableRawPercentageLevelRemaining') 
+            | list  | first | int }}
+        unit_of_measurement: '%'
+
+template:
+  - sensor:
+      - name: Inizio prossimo ciclo
+        state: >
+          {% set oggi = as_datetime(states('sensor.date')) %}
+          {% set gg_inizio_ciclo = states('input_number.hp_instantink_gg_inizio_ciclo') | int %}
+          {% set inizio_corrente = oggi.replace(day=gg_inizio_ciclo) %}
+
+          {% if oggi.day <= gg_inizio_ciclo %}
+            {{ inizio_corrente | as_local}}
+          {% else %}
+            {% if oggi.month == 12 %}
+              {{ inizio_corrente.replace(year=inizio_corrente.year+1, month=1 )| as_local}}
+            {% else %}
+              {{ inizio_corrente.replace(month=inizio_corrente.month+1)| as_local}}
+            {% endif %}
+          {% endif %}
+        device_class: timestamp
+
+      - name: Pagine piano ancora disponibili
+        state: >
+          {% set pagine_stampate = states('sensor.pagine_stampate_nel_periodo_corrente') | int %}
+          {% set pagine_nel_piano = states('input_number.hp_instantink_pagine_nel_piano') | int %}
+          {{ max(0, pagine_nel_piano - pagine_stampate ) }} 
+        unit_of_measurement: Pagine
+
+      - name: Pagine accumulate ancora disponibili
+        state: >
+          {% set pagine_stampate = states('sensor.pagine_stampate_nel_periodo_corrente') | int %}
+          {% set pagine_nel_piano = states('input_number.hp_instantink_pagine_nel_piano') | int %}
+          {% set pagine_accumulate = states('input_number.hp_instantink_pagine_accumulate') | int %}
+          {% set pagine_disponibili = pagine_nel_piano + pagine_accumulate  %}
+          {{ max(0, min(pagine_accumulate,pagine_disponibili-pagine_stampate)) }}
+        unit_of_measurement: Pagine
+
+      - name: Pagine extra piano
+        state: >
+          {% set pagine_stampate = states('sensor.pagine_stampate_nel_periodo_corrente') | int %}
+          {% set pagine_nel_piano = states('input_number.hp_instantink_pagine_nel_piano') | int %}
+          {% set pagine_accumulate = states('input_number.hp_instantink_pagine_accumulate') | int %}
+          {% set pagine_disponibili = pagine_nel_piano + pagine_accumulate  %}
+          {{ max(0, pagine_stampate - pagine_disponibili) }}
+        unit_of_measurement: Pagine
+
+      - name: Set extra
+        state: >
+          {% set pag_extra = states('sensor.pagine_extra_piano') | int %}
+          {% set pag_in_set_extra = states('input_number.hp_instantink_pagine_set_extra') | int %}
+          {{ (pag_extra / pag_in_set_extra) | round(0, 'ceil') | int }}
+
+      - name: Costo set extra
+        state: >
+          {% set set_extra = states('sensor.set_extra') | int %}
+          {% set costo_set_extra = states('input_number.hp_instantink_costo_set_extra') | float %}
+          {{ set_extra * costo_set_extra }}
+        device_class: monetary
+        unit_of_measurement: €
+
+      - name: Costo totale piano
+        state: >
+          {% set costo_set_extra = states('sensor.costo_set_extra') | float %}
+          {% set costo_piano = states('input_number.hp_instantink_costo_piano') | float %}
+          {{ costo_piano + costo_set_extra }}
+        device_class: monetary
+        unit_of_measurement: €
+
+# Utility Meter per accumulare i valori di pagine stampate
+# nel caso si debba assegnargli un valore iniziale
+# usare dev tool > services per chiamare
+# Utility Meter: Calibrate
+# impostando Value al valore voluto
+utility_meter:
+  pagine_stampate_nel_periodo:
+    source: sensor.pagine_stampate_totali
+    name: Pagine stampate nel periodo corrente
+    # siccome il campo cron non accetta template tipo
+    # cron: "0 0 {{ states('input_number.hp_instantink_gg_inizio_ciclo') | int}} * *"
+    # configuro l'utility_meter in modo da non resettarsi mai
+    # poi il reset avviene con automazione che chiama il service
+    # utility_meter.reset
+    periodically_resetting: false
+    
+# Automazione che resetta utility meter
+automation:
+  - id: '1704537228233'
+    alias: Resetto utility meter HP InstantInk
+    description: Resetto utility meter che conta le pagine stampate nel mese e il numero di pagine accumulate
+    trigger:
+    - platform: time
+      at: sensor.inizio_prossimo_ciclo
+    condition: []
+    action:
+    - service: utility_meter.calibrate
+      target:
+        entity_id: sensor.pagine_stampate_nel_periodo_corrente
+      data:
+        value: '0'
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.hp_instantink_pagine_accumulate
+      data: 
+        value: >-
+          {% set pagine_accumulate_ancora_disponibili = states('sensor.pagine_accumulate_ancora_disponibili') | int %}
+          {% set pagine_piano_ancora_disponibili = states('sensor.pagine_piano_ancora_disponibili') | int %}
+          {% set max_pag_acc = states('input_number.hp_instantink_max_pagine_accumulabili') | int %}
+          {{ min (max_pag_acc, (pagine_piano_ancora_disponibili+pagine_accumulate_ancora_disponibili)) }}
+        
+    mode: single
+
